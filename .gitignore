@@ -1,0 +1,11 @@
+.vscode/
+.DS_Store
+.env/
+__pycache__/
+*egg-info/
+build/
+dist/
+*.err
+*.out
+saved_outputs/
+PER.py
