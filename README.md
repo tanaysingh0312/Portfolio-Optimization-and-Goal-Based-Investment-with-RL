@@ -1,118 +1,74 @@
-Deep Reinforcement Learning for Dynamic Portfolio Optimization and Goal-Based Investment
+Deep Reinforcement Learning for Goal-Based Portfolio Optimization
 
-This repository presents an end-to-end Deep Reinforcement Learning (DRL) system for multi-asset portfolio management. The project integrates the Soft Actor-Critic (SAC) algorithm with a custom-designed financial environment to learn dynamic rebalancing strategies under realistic market conditions. The objective is to optimize long-term portfolio returns while managing risk and supporting investor-defined financial goals.
+Repository:
+https://github.com/tanaysingh0312/Portfolio-Optimization-and-Goal-Based-Investment-with-RL
 
-The environment models portfolio management as a continuous Markov Decision Process (MDP). At each step, the agent observes market data, portfolio configuration, and historical price information. Based on this information, it outputs continuous rebalancing actions that are converted into tradable quantities. The reward function combines risk-adjusted performance metrics (Sharpe ratio) with optional goal-based incentives to guide the learning process.
+Overview
 
-This implementation includes a modular architecture for agents, neural networks, replay buffers, data processing, logging, and evaluation. It is suitable for research, experimentation, and pedagogical use in reinforcement learning, quantitative finance, and algorithmic trading.
+This project implements a Deep Reinforcement Learning (DRL) system for goal-based portfolio optimization using the Soft Actor-Critic (SAC) algorithm.
+The agent learns how to dynamically rebalance a multi-asset portfolio while considering market uncertainty, transaction costs, cash constraints, and long-term investment goals.
+
+Unlike traditional portfolio optimization methods, this approach directly learns optimal strategies from market data using continuous control and adaptive decision-making.
 
 Key Features
 
-Soft Actor-Critic (SAC) agent for continuous trading decisions
+Soft Actor-Critic (SAC) based reinforcement learning agent
 
-Custom financial environment with realistic constraints
+Goal-based reward structure for long-term wealth targeting
 
-Risk-adjusted reward design using a Sharpe-based formulation
+Dynamic portfolio rebalancing with continuous actions
 
-Optional terminal reward for goal-based investment
+Realistic constraints such as transaction costs and cash limits
 
-Modular codebase for extensibility and experimentation
+Optional use of asset correlation features for improved learning
 
-Integrated data processing and evaluation workflows
-
-Unit tests for major components
+Modular and extensible codebase built with PyTorch
 
 Project Structure
 Portfolio-Optimization-and-Goal-Based-Investment-with-RL/
-│
-├── data/                        # Market data samples (CSV)
-├── portfolios_and_tickers/      # Portfolio templates and asset lists
-├── src/
-│   ├── environment.py           # Custom RL environment
-│   ├── agents.py                # SAC agent implementation
-│   ├── networks.py              # Policy and critic network models
-│   ├── buffer.py                # Replay buffer
-│   ├── get_data.py              # Data loading utilities
-│   ├── logger.py                # Training logs
-│   ├── run.py                   # Main training script
-│   ├── main.py                  # Execution entry point
-│   └── utilities.py             # Additional helper functions
-│
-├── tests/                       # Test suite for components
-├── requirements.txt             # Dependency specifications
-├── README.md                    # Project documentation
-└── LICENSE                      # Project license
+├── data/                     # Market data
+├── portfolios_and_tickers/   # Asset lists
+├── src/                      # Core source code
+│   ├── environment.py        # Custom investment environment
+│   ├── agents.py             # SAC agent
+│   ├── networks.py           # Neural networks
+│   ├── buffer.py             # Replay buffer
+│   └── main.py               # Training and testing entry point
+├── postprocess.ipynb         # Result analysis
+├── requirements.txt
+└── LICENSE
 
-Methodology
-State Representation
+Installation
+git clone https://github.com/tanaysingh0312/Portfolio-Optimization-and-Goal-Based-Investment-with-RL.git
+cd Portfolio-Optimization-and-Goal-Based-Investment-with-RL
 
-The agent receives a structured state vector composed of:
-
-Cash position
-
-Current asset prices
-
-Asset holdings
-
-Rolling historical price windows
-
-Normalized market indicators
-
-Action Space
-
-A continuous vector in the range [-1, 1]^n, later scaled and discretized to represent buy and sell quantities for each asset.
-
-Reward Function
-
-The primary reward is based on a risk-adjusted Sharpe formulation:
-
-r_t = λ * (R_t − R_f) / σ_t
-
-
-An optional terminal reward component supports goal-based investment scenarios.
-
-Training and Execution
-
-Install dependencies:
-
+python -m venv venv
+source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
+Usage
+Train the Agent
+python -m src.main --mode train --n_episodes 1000 --goal 120000 --auto_alpha
 
-Run the training process:
-
-python src/run.py
-
-
-Execute the main program:
-
-python src/main.py
-
-Evaluation
-
-The repository includes a Jupyter notebook for analyzing:
-
-Portfolio value curves
-
-Return and volatility metrics
-
-Sharpe ratio evolution
-
-Action patterns and trading behavior
-
-Risk characteristics and drawdowns
+Test a Trained Model
+python -m src.main --mode test --checkpoint_directory saved_outputs/YOUR_TIMESTAMP --plot
 
 Applications
 
-This project serves as a practical benchmark for:
+Goal-based investment planning
 
-Reinforcement learning research in finance
+Portfolio optimization research
 
-Portfolio management experimentation
-
-Academic coursework involving quantitative methods
-
-Comparative evaluation of DRL algorithms in continuous control settings
+Financial reinforcement learning experiments
 
 License
 
-The repository is distributed under the license included in the project.
+Apache License 2.0
+
+Author
+
+Tanay Singh
+
+GitHub: https://github.com/tanaysingh0312
+
+LinkedIn: https://www.linkedin.com/in/stanay657/
