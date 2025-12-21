@@ -1,5 +1,5 @@
 from datetime import datetime
-import gym
+import gymnasium as gym
 import itertools
 import json
 import matplotlib.pyplot as plt
@@ -13,29 +13,42 @@ sns.set_theme()
 from sklearn.preprocessing import StandardScaler
 from typing import List, Union
  
-def create_directory_tree(mode: str,
-                          experimental: bool,
-                          checkpoint_directory: str):
+def create_directory_tree(checkpoint_directory: str = None,
+                          simple: bool = False,
+                          mode: str = 'train'):
+    """Creates the necessary directory structure for saving logs, networks, and plots.
 
-    date: str = datetime.now().strftime("%Y.%m.%d.%H.%M.%S")
+    It creates a timestamped folder inside 'saved_outputs/' unless 'simple' is True
+    or 'checkpoint_directory' is explicitly provided.
+
+    Args:
+        checkpoint_directory (str, optional): The base directory for saving outputs. 
+                                              If None, a new timestamped directory is created. Defaults to None.
+        simple (bool, optional): If True, forces the creation of a new timestamped 
+                                 directory regardless of 'checkpoint_directory' being None. 
+                                 Defaults to False.
+        mode (str, optional): Not currently used in directory creation logic but kept for compatibility. 
+                              Defaults to 'train'.
+                                  
+    Returns:
+        str: The path to the newly created base checkpoint directory.
+    """
     
-    if experimental:
-        checkpoint_directory = os.path.join("saved_outputs", "experimental")
-    else:
-        checkpoint_directory = os.path.join("saved_outputs", date) if mode=='train' else checkpoint_directory
-        
-    # Create various subdirectories
+    date = datetime.now().strftime("%Y.%m.%d.%H.%M.%S")
+
+    # If simple is True or no checkpoint_directory is provided, create a new timestamped one
+    if simple or checkpoint_directory is None:
+        checkpoint_directory = os.path.join("saved_outputs", date)
+
+    # Define paths for subdirectories
     checkpoint_directory_networks = os.path.join(checkpoint_directory, "networks")
     checkpoint_directory_logs = os.path.join(checkpoint_directory, "logs")
     checkpoint_directory_plots = os.path.join(checkpoint_directory, "plots")
+
+    # Create the directories
     Path(checkpoint_directory_networks).mkdir(parents=True, exist_ok=True)
     Path(checkpoint_directory_logs).mkdir(parents=True, exist_ok=True)
     Path(checkpoint_directory_plots).mkdir(parents=True, exist_ok=True)
-    
-    # write the checkpoint directory name in a file for quick access when testing
-    if mode == 'train':
-        with open(os.path.join(checkpoint_directory, "checkpoint_directory.txt"), "w") as f:
-            f.write(checkpoint_directory) 
 
     return checkpoint_directory
 
@@ -84,43 +97,67 @@ def plot_portfolio_value(x: List[int],
     plt.title('Portfolio value')
     plt.savefig(figure_file) 
         
-def instanciate_scaler(env: gym.Env,
-                       mode: str,
-                       checkpoint_directory: str) -> StandardScaler:
-    """Instanciate and either fit or load parameter depending on mode.
-    
-    In train mode, the agent behaves randomly in order to store typical observations in the environment.
-    The random agent trades for 10 episodes to have a more accurate scaler.
+def instanciate_scaler(use_scaler: bool,
+                       env: gym.Env = None,
+                       mode: str = 'train',
+                       checkpoint_directory: str = None) -> Union[StandardScaler, None]:
+    """Instanciate and either fit or load the StandardScaler parameters depending on the mode and configuration.
+
+    In train mode, if scaling is enabled, the agent behaves randomly in order to store typical observations 
+    in the environment, which are then used to fit the scaler.
     
     Args:
-        env (gym.Env): trading environment
-        mode (mode): train or test
+        use_scaler (bool): Flag indicating whether to use scaling or not.
+        env (gym.Env, optional): Trading environment. Required if use_scaler is True and mode is 'train'.
+        mode (str): train or test.
+        checkpoint_directory (str): Directory where the scaler file is saved/loaded. Required if use_scaler is True.
         
     Returns:
-        trained sklearn standard scaler
+        StandardScaler or None: A trained sklearn standard scaler object, or None if use_scaler is False.
     """
     
+    if not use_scaler:
+        # If scaling is not used, return None immediately.
+        return None
+
     scaler = StandardScaler()
     
     if mode == 'train':
         
+        # Check if environment and checkpoint_directory are provided for fitting
+        if env is None or checkpoint_directory is None:
+            # If the necessary context for fitting is missing, return the instantiated scaler 
+            # and warn the user. This addresses the incorrect call location in main.py.
+            print("WARNING: 'env' and 'checkpoint_directory' were not provided in 'train' mode when 'use_scaler' is True. Skipping environment interaction for scaler fitting.")
+            return scaler
+
         observations = []
         for _ in range(10):
-            observation = env.reset()
+            observation, info = env.reset()
             observations.append(observation)
             done = False
             while not done:
                 action = env.action_space.sample()
-                observation_, _, done, _ = env.step(action)
+                observation_, _, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
                 observations.append(observation_)
 
         scaler.fit(observations)
+        Path(os.path.join(checkpoint_directory, 'networks')).mkdir(parents=True, exist_ok=True)
         with open(os.path.join(checkpoint_directory, 'networks', 'scaler.pkl'), 'wb') as f:
             pickle.dump(scaler, f)
     
     if mode == 'test':
-        with open(os.path.join(checkpoint_directory, 'networks', 'scaler.pkl'), 'rb') as f:
-            scaler = pickle.load(f)
+        if checkpoint_directory is None:
+            print("ERROR: 'checkpoint_directory' must be provided in 'test' mode when scaling is enabled. Returning None.")
+            return None
+            
+        try:
+            with open(os.path.join(checkpoint_directory, 'networks', 'scaler.pkl'), 'rb') as f:
+                scaler = pickle.load(f)
+        except FileNotFoundError:
+            print("ERROR: Scaler file not found. Cannot run in 'test' mode with scaling. Returning None.")
+            return None
     
     return scaler
 
