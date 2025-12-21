@@ -27,114 +27,102 @@ class Network(torch.nn.Module):
         torch.save(self.state_dict(), self.checkpoint_file)
 
     def load_checkpoint(self) -> None:
-        """Loads the network's state dictionary from the saved checkpoint."""
-        torch.load(self.checkpoint_file)
-
+        """Loads the network's state dictionary."""
+        # Using map_location to ensure correct device mapping on load
+        self.load_state_dict(torch.load(self.checkpoint_file, map_location=self.device))
+        
 class Actor(Network):
-    """Actor Network for the SAC agent. Outputs the mean and standard deviation of the action distribution."""
-    
+    """
+    Implements the Actor network for SAC, which outputs the mean (mu) and log standard deviation (log_sigma)
+    of a Gaussian distribution over actions.
+    """
     def __init__(self,
                  input_shape: Tuple,
-                 n_actions: int,
-                 layer_neurons: int, 
-                 network_name: str, 
+                 n_actions: int, 
+                 layer_neurons: int,
+                 network_name: str,
                  checkpoint_directory_networks: str,
                  device: str = 'cpu',
                  log_sigma_min: float = -20.0,
                  log_sigma_max: float = 2.0,
                  ) -> None:
-        """Constructor method for the Actor class."""
-        
-        super(Actor, self).__init__(input_shape=input_shape,
-                                    layer_neurons=layer_neurons,
-                                    network_name=network_name,
-                                    checkpoint_directory_networks=checkpoint_directory_networks,
-                                    device=device)
-
-        # Input is the state vector
-        self.linear_1 = torch.nn.Linear(*input_shape, layer_neurons)
+        super(Actor, self).__init__(input_shape, layer_neurons, network_name, checkpoint_directory_networks, device)
+        input_dim = input_shape[0] 
+        self.linear_1 = torch.nn.Linear(input_dim, layer_neurons)
         self.linear_2 = torch.nn.Linear(layer_neurons, layer_neurons)
-
-        # Two outputs: mean (mu) and log_std (log_sigma)
         self.linear_mu = torch.nn.Linear(layer_neurons, n_actions)
         self.linear_log_sigma = torch.nn.Linear(layer_neurons, n_actions)
-        
-        # Hyperparameters for clamping the log_sigma
         self.log_sigma_min = log_sigma_min
         self.log_sigma_max = log_sigma_max
+        # No optimizer defined here; it's managed by the Agent.
 
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.0003)
-
-    def forward(self, 
-                state: torch.Tensor,
-                ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Performs a forward pass, outputting the mean and log-standard deviation."""
-        
-        x = torch.nn.functional.gelu(self.linear_1(state))
-        x = torch.nn.functional.gelu(self.linear_2(x))
-
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Performs a forward pass, outputting the mean (mu) and log standard deviation (log_sigma)."""
+        x = torch.nn.functional.relu(self.linear_1(state))
+        x = torch.nn.functional.relu(self.linear_2(x))
         mu = self.linear_mu(x)
         log_sigma = self.linear_log_sigma(x)
-        
-        # Clamping log_sigma to ensure stability
-        log_sigma = torch.clamp(log_sigma, min=self.log_sigma_min, max=self.log_sigma_max)
-
+        # Clamp log_sigma to ensure stability
+        log_sigma = torch.clamp(log_sigma, self.log_sigma_min, self.log_sigma_max)
         return mu, log_sigma
 
-    def sample(self, 
-               state: torch.Tensor,
-               reparameterize: bool = True,
-               ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Samples an action from the resulting distribution using the reparameterization trick."""
-        
+    def sample_normal(self, state, reparameterize=True, deterministic=False):
+        """
+        Samples an action from the policy distribution, calculates log probabilities, 
+        and applies the tanh squash function.
+        FIX 2: This method is now correctly named `sample_normal`.
+        """
         mu, log_sigma = self.forward(state)
+        
+        if deterministic:
+            # Use the mean for deterministic actions (e.g., in evaluation mode)
+            action = torch.tanh(mu)
+            return action, None
+        
         sigma = log_sigma.exp()
+        probabilities = torch.distributions.Normal(mu, sigma)
         
-        # Create the normal distribution
-        normal = torch.distributions.Normal(mu, sigma)
-        
-        # Sample an action
         if reparameterize:
-            actions = normal.rsample() # Uses reparameterization trick for training
+            # Reparameterization trick for policy gradient
+            actions = probabilities.rsample()
         else:
-            actions = normal.sample()  # Standard sample for evaluation/target calculation
+            # Simple sampling for exploration or non-gradient steps
+            actions = probabilities.sample()
             
-        # Log-probability of the sampled action (for SAC entropy term)
-        log_probs = normal.log_prob(actions).sum(axis=-1, keepdim=True)
+        action = torch.tanh(actions)
         
-        # The actions are in the range (-inf, inf), we squash them to [-1, 1] using tanh
-        actions = torch.tanh(actions)
+        # Log probability with correction for the tanh squash (SAC standard)
+        # log_prob = log_pi(a|s) - sum(log(1 - tanh(a_i)^2))
+        log_probs = probabilities.log_prob(actions) - torch.log(1 - action.pow(2) + 1e-6)
         
-        # Correction term for log_probs due to tanh squashing
-        log_probs -= torch.log(1 - actions.pow(2) + 1e-6).sum(axis=-1, keepdim=True)
-        
-        return actions, log_probs, torch.tanh(mu) # Return sampled action, log_prob, and deterministic action
+        # Sum log probabilities over action dimensions (d-dimensional action space)
+        return action, log_probs.sum(dim=1, keepdim=True)
 
 class Critic(Network):
-    """Q-Network (Critic) for the SAC agent. Estimates Q(s, a)."""
+    """
+    Implements the standard Q-network for SAC, which estimates Q(s, a).
+    Outputs a single scalar Q-value.
+    """
     
     def __init__(self,
-                 input_shape: Tuple,
-                 n_actions: int,
-                 layer_neurons: int, 
-                 network_name: str, 
+                 input_shape: Tuple, 
+                 n_actions: int, 
+                 layer_neurons: int,
+                 network_name: str,
                  checkpoint_directory_networks: str,
                  device: str = 'cpu',
                  ) -> None:
         """Constructor method for the Critic class."""
         
-        super(Critic, self).__init__(input_shape=input_shape,
-                                     layer_neurons=layer_neurons,
-                                     network_name=network_name,
-                                     checkpoint_directory_networks=checkpoint_directory_networks,
-                                     device=device)
-
+        super(Critic, self).__init__(input_shape, layer_neurons, network_name, checkpoint_directory_networks, device)
+        
         # Input is the concatenated state and action vector
-        self.linear_1 = torch.nn.Linear(*input_shape + n_actions, layer_neurons)
+        # Assuming observation space is 1D (S,)
+        input_dim = input_shape[0] + n_actions
+        
+        self.linear_1 = torch.nn.Linear(input_dim, layer_neurons)
         self.linear_2 = torch.nn.Linear(layer_neurons, layer_neurons)
-        self.linear_3 = torch.nn.Linear(layer_neurons, 1) # Output is a single Q-value
-
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.0003)
+        self.linear_Q = torch.nn.Linear(layer_neurons, 1)
 
     def forward(self, 
                 state: torch.Tensor, 
@@ -142,107 +130,92 @@ class Critic(Network):
                 ) -> torch.Tensor:
         """Performs a forward pass, outputting the Q-value."""
         
-        # Concatenate state and action
         x = torch.cat([state, action], dim=1) 
         
-        x = torch.nn.functional.gelu(self.linear_1(x))
-        x = torch.nn.functional.gelu(self.linear_2(x))
-        q = self.linear_3(x)
-        
-        return q
+        x = torch.nn.functional.relu(self.linear_1(x))
+        x = torch.nn.functional.relu(self.linear_2(x))
+        Q_value = self.linear_Q(x)
+        return Q_value
 
 class Value(Network):
-    """Value Network V(s) for the SAC agent. Estimates the state value."""
+    """
+    Implements the Value network for SAC, which estimates V(s).
+    Outputs a single scalar V-value.
+    """
     
     def __init__(self,
                  input_shape: Tuple,
-                 layer_neurons: int, 
-                 network_name: str, 
+                 layer_neurons: int,
+                 network_name: str,
                  checkpoint_directory_networks: str,
                  device: str = 'cpu',
                  ) -> None:
         """Constructor method for the Value class."""
         
-        super(Value, self).__init__(input_shape=input_shape,
-                                     layer_neurons=layer_neurons,
-                                     network_name=network_name,
-                                     checkpoint_directory_networks=checkpoint_directory_networks,
-                                     device=device)
-
-        # Input is the state vector
-        self.linear_1 = torch.nn.Linear(*input_shape, layer_neurons)
+        super(Value, self).__init__(input_shape, layer_neurons, network_name, checkpoint_directory_networks, device)
+        input_dim = input_shape[0] 
+        self.linear_1 = torch.nn.Linear(input_dim, layer_neurons)
         self.linear_2 = torch.nn.Linear(layer_neurons, layer_neurons)
-        self.linear_3 = torch.nn.Linear(layer_neurons, 1) # Output is a single Value
+        self.linear_V = torch.nn.Linear(layer_neurons, 1)
 
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.0003)
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """Performs a forward pass, outputting the V-value."""
+        x = torch.nn.functional.relu(self.linear_1(state))
+        x = torch.nn.functional.relu(self.linear_2(x))
+        V_value = self.linear_V(x)
+        return V_value
 
-    def forward(self, 
-                state: torch.Tensor,
-                ) -> torch.Tensor:
-        """Performs a forward pass, outputting the Value."""
-        
-        x = torch.nn.functional.gelu(self.linear_1(state))
-        x = torch.nn.functional.gelu(self.linear_2(x))
-        v = self.linear_3(x)
-        
-        return v
-        
 class Distributional_Critic(Network):
-    """Distributional Critic Network. Outputs the mean and standard deviation of the Q-value distribution."""
-    
-    # NOTE: The implementation of the Distributional_Critic will mirror the structure
-    # of the Actor but takes both state and action as input and outputs the distribution
-    # parameters for the Q-value. The full implementation would require changes
-    # to the SAC loss, but for this project, we'll keep the required network structure
-    # consistent with the SAC paper's distributional variant.
-    
+    """
+    Placeholder for the Distributional Q-network (Q(s, a) as a Gaussian distribution).
+    """
     def __init__(self,
-                 input_shape: Tuple,
-                 n_actions: int,
-                 layer_neurons: int, 
-                 network_name: str, 
+                 input_shape: Tuple, 
+                 n_actions: int, 
+                 layer_neurons: int,
+                 network_name: str,
                  checkpoint_directory_networks: str,
                  device: str = 'cpu',
                  log_sigma_min: float = -20.0,
                  log_sigma_max: float = 2.0,
                  ) -> None:
-        """Constructor method for the Distributional_Critic class."""
+        """Constructor method for the Distributional Critic class."""
         
-        super(Distributional_Critic, self).__init__(input_shape=input_shape,
-                                                    layer_neurons=layer_neurons,
-                                                    network_name=network_name,
-                                                    checkpoint_directory_networks=checkpoint_directory_networks,
-                                                    device=device)
-                                                    
+        super(Distributional_Critic, self).__init__(input_shape, layer_neurons, network_name, checkpoint_directory_networks, device)
+        
+        # Cast n_actions to int if it's a tuple (from env.action_space.shape)
+        if isinstance(n_actions, tuple):
+            n_actions_int = int(np.prod(n_actions))
+        else:
+            n_actions_int = int(n_actions)
+
         # Input is the concatenated state and action vector
-        input_dim = input_shape[0] + n_actions
+        # Assuming observation space is 1D (S,)
+        input_dim = input_shape[0] + n_actions_int
+        
         self.linear_1 = torch.nn.Linear(input_dim, layer_neurons)
         self.linear_2 = torch.nn.Linear(layer_neurons, layer_neurons)
 
-        # Two outputs: mean (mu) and log_std (log_sigma) of the Q-distribution
+        # Two outputs: mean (mu) and log_std (log_sigma) of the Q-distribution (simplified placeholder)
         self.linear_mu = torch.nn.Linear(layer_neurons, 1)
         self.linear_log_sigma = torch.nn.Linear(layer_neurons, 1)
         
         self.log_sigma_min = log_sigma_min
         self.log_sigma_max = log_sigma_max
 
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.0003)
-
     def forward(self, 
                 state: torch.Tensor, 
                 action: torch.Tensor,
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Performs a forward pass, outputting the mean (mu) and standard deviation (sigma) of the Q-distribution."""
+        """Performs a forward pass, outputting the mean (mu) and log standard deviation (log_sigma) of the Q-distribution."""
         
         x = torch.cat([state, action], dim=1) 
         
-        x = torch.nn.functional.gelu(self.linear_1(x))
-        x = torch.nn.functional.gelu(self.linear_2(x))
-
+        x = torch.nn.functional.relu(self.linear_1(x))
+        x = torch.nn.functional.relu(self.linear_2(x))
+        
         mu = self.linear_mu(x)
         log_sigma = self.linear_log_sigma(x)
+        log_sigma = torch.clamp(log_sigma, self.log_sigma_min, self.log_sigma_max)
         
-        log_sigma = torch.clamp(log_sigma, min=self.log_sigma_min, max=self.log_sigma_max)
-        sigma = log_sigma.exp()
-
-        return mu, sigma
+        return mu, log_sigma
