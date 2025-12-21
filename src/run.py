@@ -1,4 +1,4 @@
-import gym
+import gymnasium as gym
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 
@@ -33,44 +33,40 @@ class Run():
         self.best_reward = -np.inf
         self.episode = 1
         self.step = 1
-        
         self.logger = Logger(mode=mode, checkpoint_directory=checkpoint_directory)
+        
+        # FIX 4: Logger initial portfolio value NEVER SET
+        # Call the setter method on the logger instance immediately after environment creation
+        self.logger._store_initial_value_portfolio(self.env.initial_portfolio_value)
         
         if self.mode == 'test':
             self.agent.load_networks()
-        
-        if self.scaler is not None and self.mode == 'train':
-            self.scaler.fit(self.env.stock_market_history.values)
 
-    def run_episode(self) -> None:
-        """Runs one full episode."""
-        
-        observation = self.env.reset()
+    def run_episode(self):
+        """Runs a single episode, including environment interaction and agent learning/evaluation."""
+        observation, info = self.env.reset()
         done = False
-        reward = 0.0 # Stores cumulative reward for the episode
+        reward = 0
+        portfolio_value_history = []
+        portfolio_content_history = []
         
-        if self.mode == 'test':
-            portfolio_value_history = [self.env.initial_portfolio_value]
-            portfolio_content_history = [self.env.number_of_shares]
+        self.logger.set_time_stamp(1)
         
         while not done:
-            
-            # Scale observation if scaler is provided (scaler handles all features including the new GBI features)
             if self.scaler is not None:
-                # We do not scale the last feature (Time-to-Goal Ratio) as it's already normalized [0, 1]
-                # Scale all features *except* the last one (the Time-to-Goal ratio)
-                scaled_observation_features = self.scaler.transform(observation[:-1].reshape(1, -1))[0]
-                
-                # Reconstruct the observation: scaled features + unscaled Time-to-Goal ratio
-                scaled_observation = np.append(scaled_observation_features, observation[-1])
-                action = self.agent.choose_action(scaled_observation)
+                # Scale the observation before feeding to the agent
+                observation_scaled = self.scaler.transform([observation])[0]
             else:
-                action = self.agent.choose_action(observation)
-
-            observation_, step_reward, done, info = self.env.step(action)
-
-            # Update cumulative reward
-            # Original code had 'reward += reward', which is a typo. It should accumulate the step_reward.
+                observation_scaled = observation
+                
+            # Choose action: deterministic for test mode, stochastic for train mode
+            action = self.agent.choose_action(observation_scaled, evaluate=(self.mode == 'test'))
+            
+            # Environment step
+            observation_, step_reward, terminated, truncated, info = self.env.step(action)
+            done = terminated or truncated
+            
+            # Accumulate reward (Note: fixed potential typo in original code logic)
             reward += step_reward
             
             self.step += 1
@@ -80,14 +76,17 @@ class Run():
                 portfolio_content_history.append(self.env.number_of_shares)
             
             # The agent stores the *unscaled* observation in the buffer
-            self.agent.remember(observation, action, step_reward, observation_, done)
+            # FIX 3: Agent method mismatch: replace 'remember' with 'store_transition'
+            self.agent.store_transition(observation, action, step_reward, observation_, done)
             
             if self.mode == 'train':
                 # The agent learns using the *unscaled* data from the buffer
-                self.agent.learn(self.step)
+                # FIX 3: Agent method mismatch: replace 'learn(self.step)' with 'learn()'
+                self.agent.learn()
                 
             observation = observation_
              
+        # Logging episode results
         self.logger.logs["reward_history"].append(reward)
         average_reward = np.mean(self.logger.logs["reward_history"][-50:])
         
@@ -100,7 +99,7 @@ class Run():
         self.logger.set_time_stamp(2)
         self.logger.print_status(episode=self.episode)
         
-        if average_reward > self.best_reward:
+        # Save networks if current performance is the best so far
+        if average_reward > self.best_reward and self.mode == 'train':
             self.best_reward = average_reward
-            if self.mode == 'train':
-                self.agent.save_networks()
+            self.agent.save_networks()
