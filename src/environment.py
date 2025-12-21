@@ -1,4 +1,4 @@
-import gym
+import gymnasium as gym
 import numpy as np
 import pandas as pd
 from typing import Tuple
@@ -23,154 +23,227 @@ class Environment(gym.Env):
                  bank_rate: float = 0.5,
                  limit_n_stocks: float = 200,
                  buy_rule: str = 'most_first',
-                 
-                 # --- NEW GBI PARAMETERS ---
                  target_return_rate: float = 0.25,
                  max_steps_per_episode: int = 252,
-                 # --------------------------
-                 
                  use_corr_matrix: bool = False,
                  use_corr_eigenvalues: bool = False,
                  window: int = 20,
                  number_of_eigenvalues: int = 10,
+                 # FIX: Compatibility patch to accept extra args from main.py without error
+                 limit_trading: bool = False,
+                 **kwargs
                  ) -> None:
-        """Constructor method for the Environment class."""
         
         self.stock_market_history = stock_market_history
         self.stock_history_size = self.stock_market_history.shape[0]
         self.window = window
         self.number_of_eigenvalues = number_of_eigenvalues
+        self.use_corr_matrix = use_corr_matrix
+        self.use_corr_eigenvalues = use_corr_eigenvalues
         
-        # initial portfolio
         self.cash_in_bank = initial_portfolio['cash_in_bank']
         self.number_of_shares = initial_portfolio['number_of_shares']
         self.n_stocks = len(self.number_of_shares)
         
-        # costs and rules
         self.buy_cost = buy_cost
         self.sell_cost = sell_cost
         self.bank_rate = bank_rate
         self.limit_n_stocks = limit_n_stocks
         self.buy_rule = buy_rule
+        
+        # Apply goal/time_horizon values if they were passed via kwargs (from main.py)
+        goal = kwargs.get('goal')
+        if goal is not None:
+             # Assuming 'goal' is factor (e.g., 1.1) and target_return_rate is percentage (e.g., 0.1)
+             self.target_return_rate = goal - 1.0 
+        else:
+             self.target_return_rate = target_return_rate
 
-        # --- GBI GOAL DEFINITION ---
-        self.target_return_rate = target_return_rate
-        self.max_steps_per_episode = max_steps_per_episode
-        self.initial_portfolio_value = self._get_portfolio_value()
-        # The explicit goal the agent must achieve by the end of the episode
-        self.goal_value = self.initial_portfolio_value * (1.0 + self.target_return_rate)
-        self.current_step = 0 # Tracks time-to-goal
-        # ---------------------------
-        
-        # observation space (state vector dimension)
-        self.observation_space_dimension = (1 + # cash in bank
-                                            self.n_stocks + # stock prices
-                                            self.n_stocks + # owned shares
-                                            # --- NEW: +1 for Time-to-Goal Feature ---
-                                            1)
-        
-        if use_corr_matrix:
-            self.stock_market_history = append_corr_matrix(self.stock_market_history, window=window)
-            self.observation_space_dimension += self.n_stocks * self.n_stocks
-        
-        if use_corr_eigenvalues:
-            self.stock_market_history = append_corr_matrix_eigenvalues(self.stock_market_history, window=window, number_of_eigenvalues=number_of_eigenvalues)
-            self.observation_space_dimension += number_of_eigenvalues
-            
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.observation_space_dimension,))
-        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self.n_stocks,))
-        
-        self.reset()
-        
-    def reset(self) -> np.array:
-        """Reset the environment to a new random starting point."""
-        
-        self.step_in_history = 0
-        self.steps_remaining = self.stock_history_size - self.max_steps_per_episode
-        self.start_index = np.random.choice(self.steps_remaining)
-        
-        self.current_data = self.stock_market_history.iloc[self.start_index: self.start_index + self.max_steps_per_episode]
-        self.portfolio_value = self._get_portfolio_value()
-        
-        # Reset GBI trackers
+        time_horizon = kwargs.get('time_horizon')
+        if time_horizon is not None:
+             self.max_steps_per_episode = time_horizon
+        else:
+             self.max_steps_per_episode = max_steps_per_episode
+
         self.current_step = 0
-        self.initial_portfolio_value = self.portfolio_value
+        
+        # Determine the starting point in the data history based on the window size
+        # We start at 'window' to allow for correlation matrix computation
+        self.step_in_history = self.window 
+        self.current_data = self.stock_market_history.iloc[self.step_in_history - self.window : self.step_in_history + self.max_steps_per_episode + 1]
+
+        # FIX: Initialize stock_prices BEFORE calculating initial_portfolio_value
+        # Initialize stock prices at the starting step (the day *before* the first trade day)
+        self.stock_prices = self.current_data.iloc[self.window-1][:self.n_stocks].values
+        
+        # This call now works because self.stock_prices is defined
+        self.initial_portfolio_value = self._get_portfolio_value()
         self.goal_value = self.initial_portfolio_value * (1.0 + self.target_return_rate)
-        
-        return self._get_observation()
-    
-    # ... (Other methods like _next_day, _buy_stock, _sell_stock remain the same)
 
-    def step(self, action: np.array) -> Tuple[np.array, float, bool, dict]:
-        """Performs one step of the environment."""
+        # Calculate the dimension of the observation space (cash + prices + shares + time_to_goal)
+        self.observation_space_dimension = 1 + 2 * self.n_stocks + 1 
         
-        self.terminal = False
+        # Adjust dimension if using correlation features
+        if self.use_corr_matrix:
+            self.observation_space_dimension += self.n_stocks ** 2
+        elif self.use_corr_eigenvalues:
+            self.observation_space_dimension += self.number_of_eigenvalues
         
-        # Clip action to action space limits
-        action = np.clip(action, self.action_space.low, self.action_space.high)
-        
-        # Get dollar value of actions
-        dollar_value_action = action * self.portfolio_value
-        
-        # Determine whether to buy or sell for each stock based on action sign
-        for idx in range(self.n_stocks):
-            if dollar_value_action[idx] > 0:
-                self._buy_stock(idx, dollar_value_action[idx])
-            else:
-                self._sell_stock(idx, abs(dollar_value_action[idx]))
-                
-        # Update prices, bank rate, and calculate base reward
-        self._next_day()
-        
-        new_portfolio_value = self._get_portfolio_value()
-        
-        # BASE REWARD: Log-return from day-to-day (standard SAC)
-        reward = np.log(new_portfolio_value / self.portfolio_value)
-        self.portfolio_value = new_portfolio_value
-        
-        # 2. Advance time step
-        self.current_step += 1
-        
-        # 3. --- GBI TERMINAL REWARD LOGIC (CRITICAL FOR PROJECT UNIQUENESS) ---
-        if self.current_step >= self.max_steps_per_episode:
-            self.terminal = True
-            
-            # Calculate the final portfolio value's performance relative to the goal
-            performance_ratio = new_portfolio_value / self.goal_value
-            
-            # Explicit, large terminal reward structure for Goal-Based Investing
-            if performance_ratio >= 1.0:
-                # Large bonus for reaching/exceeding the goal
-                terminal_reward = 10.0 + 50.0 * (performance_ratio - 1.0) # Bonus for exceeding
-            else:
-                # Severe penalty for missing the goal, scaled by how far it was missed
-                terminal_reward = -100.0 * (1.0 - performance_ratio) # Penalty for shortfall
-            
-            reward += terminal_reward # Add the terminal goal outcome to the last step's reward
-            
-            # Print status at the end of the GBI episode
-            print(f"\n--- GBI Episode End ---")
-            print(f"Initial Value: ${self.initial_portfolio_value:,.2f}")
-            print(f"Goal Value: ${self.goal_value:,.2f} ({self.target_return_rate*100:.0f}%)")
-            print(f"Final Value: ${new_portfolio_value:,.2f}")
-            print(f"Terminal Reward Added: {terminal_reward:.2f}")
-            print("-----------------------")
-        # -------------------------------------------------------------------
+        # Define observation space bounds
+        high = np.inf * np.ones(self.observation_space_dimension)
+        low = -high
+        self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
 
-        # 4. Prepare next observation
-        observation_ = self._get_observation()
-        
-        return observation_, reward, self.terminal, {}
-    
-    
-    def _get_observation(self) -> np.array:
-        """Observation in the format given by the state_space, and perceived by the agent.
-        
-        The final element is the Time-to-Goal ratio (1.0 at start, 0.0 at end).
+        # Define action space (fractional weights to buy/sell/hold)
+        high = 1.0 * np.ones(self.n_stocks)
+        low = -1.0 * np.ones(self.n_stocks)
+        self.action_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
 
-        Returns:
-            np.array for the observation
+        
+    def reset(self, seed=None, options=None):
+        """Resets the state of the environment and returns an initial observation."""
+
+        super().reset(seed=seed)
+        # Reset time in episode
+        self.current_step = 0
+
+        # Determine a new random starting point in the history for this episode
+        # The episode must fit entirely within the remaining history
+        end_point = self.stock_history_size - self.max_steps_per_episode
+        if end_point < self.window:
+            # Not enough data for a full episode with the window size
+            self.step_in_history = self.window
+        else:
+            # Start randomly between window and the point that allows a full episode
+            self.step_in_history = np.random.randint(self.window, end_point + 1)
+        
+        # Slice the data for the current episode
+        self.current_data = self.stock_market_history.iloc[self.step_in_history - self.window : self.step_in_history + self.max_steps_per_episode + 1]
+
+        # Reset portfolio to initial values
+        self.cash_in_bank = self.initial_portfolio_value  # Use the total initial value
+        self.number_of_shares = np.zeros(self.n_stocks)
+        
+        # Update stock prices for the reset step (must be the one just before the first trading day)
+        self.stock_prices = self.current_data.iloc[self.window-1][:self.n_stocks].values
+        
+        # Return the initial observation (state)
+        observation = self._get_observation()
+        return observation, {}
+
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
         """
+        Executes one time step within the environment.
+        """
+        
+        # Move to the next day's price data
+        self.current_step += 1
+
+        max_step = len(self.current_data) - self.window - 1
+        if self.current_step >= max_step:
+            terminated = True
+            truncated = False
+            reward = 0.0
+            info = {}
+
+            final_portfolio_value = self._get_portfolio_value()
+            if final_portfolio_value >= self.goal_value:
+                reward += 1000.0
+            else:
+                reward += -1000.0
+
+            observation = self._get_observation()
+            return observation, reward, terminated, truncated, info
+        
+        # Check for episode termination
+        terminated = self.current_step >= self.max_steps_per_episode
+        truncated = False
+        
+        # Get stock prices for the start of the current day (used for trade execution)
+        # Note: self.current_step is 1-indexed (1 to max_steps_per_episode)
+        current_stock_prices = self.current_data.iloc[self.window + self.current_step - 1][:self.n_stocks].values
+        
+        # --- Trade Execution ---
+        
+        # Action is normalized between -1 and 1
+        # action > 0 means buy, action < 0 means sell
+        
+        # Calculate the net amount of shares to buy/sell
+        # The total action value should be proportional to the current portfolio value
+        current_portfolio_value = self._get_portfolio_value()
+        
+        # The trade amount for each stock (in currency)
+        trade_amount_currency = current_portfolio_value * action 
+        
+        # Process selling and buying separately to ensure valid cash flow
+        
+        # 1. Selling (action < 0)
+        sell_actions_currency = np.maximum(0, -trade_amount_currency)
+        shares_to_sell = np.floor(sell_actions_currency / current_stock_prices)
+        
+        # Limit selling to available shares
+        shares_to_sell = np.minimum(shares_to_sell, self.number_of_shares)
+        
+        total_sell_value = np.sum(shares_to_sell * current_stock_prices)
+        sell_cost = total_sell_value * self.sell_cost
+        
+        # Update cash and shares after selling
+        self.cash_in_bank += (total_sell_value - sell_cost)
+        self.number_of_shares -= shares_to_sell
+        
+        # 2. Buying (action > 0)
+        buy_actions_currency = np.maximum(0, trade_amount_currency)
+        shares_to_buy_float = buy_actions_currency / current_stock_prices
+        
+        # Limit shares to buy based on cash available (after selling)
+        shares_to_buy_max_cash = np.floor(self.cash_in_bank / current_stock_prices)
+        
+        # Determine final shares to buy (integer only)
+        shares_to_buy = np.floor(np.minimum(shares_to_buy_float, shares_to_buy_max_cash))
+        
+        total_buy_value = np.sum(shares_to_buy * current_stock_prices)
+        buy_cost = total_buy_value * self.buy_cost
+        
+        # Update cash and shares after buying
+        self.cash_in_bank -= (total_buy_value + buy_cost)
+        self.number_of_shares += shares_to_buy
+
+        # --- Update Prices and Get New State ---
+
+        # Prices for the end of the day (used for next day's observation/portfolio value)
+        self.stock_prices = self.current_data.iloc[self.window + self.current_step][:self.n_stocks].values
+        
+        # Calculate the portfolio value after all trades and price changes
+        new_portfolio_value = self._get_portfolio_value()
+
+        # --- Reward Calculation ---
+        
+        # The reward is the daily log return of the portfolio
+        log_return = np.log(new_portfolio_value / current_portfolio_value)
+        reward = log_return
+        
+        # --- Terminal Reward (GBI) ---
+        if terminated:
+            final_portfolio_value = new_portfolio_value
+            
+            if final_portfolio_value >= self.goal_value:
+                # Large positive reward for reaching the goal
+                terminal_reward = 1000.0
+            else:
+                # Large negative penalty for failing the goal
+                terminal_reward = -1000.0
+                
+            reward += terminal_reward
+
+        # Get the next observation
+        observation = self._get_observation()
+        
+        info = {'portfolio_value': new_portfolio_value}
+
+        return observation, reward, terminated, truncated, info
+
+    def _get_observation(self) -> np.ndarray:
+        """Returns the current state of the environment as an observation vector."""
         
         # Calculate time-to-goal (normalized from 1.0 down to 0.0)
         time_to_goal_ratio = (self.max_steps_per_episode - self.current_step) / self.max_steps_per_episode
@@ -195,7 +268,12 @@ class Environment(gym.Env):
         # Add correlation matrix or eigenvalues if configured
         if self.use_corr_matrix or self.use_corr_eigenvalues:
             # Assumes the utilities correctly format and append these features
-            extra_features = self.current_data.iloc[self.step_in_history][self.n_stocks+1:].values
+            # Indexing: self.window + self.current_step gives the index into self.current_data
+            idx = self.window + self.current_step
+            if 0 <= idx < len(self.current_data):
+                extra_features = self.current_data.iloc[idx][:self.n_stocks].values
+            else:
+                extra_features = np.zeros(self.n_stocks)
             observation[offset+1 : ] = extra_features
         
         return observation
