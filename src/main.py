@@ -1,84 +1,308 @@
-from argparse import ArgumentParser
-import json 
-import numpy as np
 import os
-import time
-import torch
+import pandas as pd
+from pathlib import Path
+from typing import List
+import argparse
+import json
+import numpy as np
 
 from src.agents import instanciate_agent
 from src.environment import Environment
-from src.get_data import load_data
 from src.run import Run
-from src.utilities import create_directory_tree, instanciate_scaler, prepare_initial_portfolio
+from src.utilities import append_corr_matrix, append_corr_matrix_eigenvalues, create_directory_tree, instanciate_scaler # Import utilities for data augmentation
 
-def main(args):
+class DataFetcher():
+    """
+    A class to fetch stock data from Yahoo Finance (yfinance) and save it locally.
+    """
+    
+    def __init__(self,
+                 stock_symbols: List[str],
+                 start_date: str = "2010-01-01",
+                 end_date: str = "2020-12-31",
+                 directory_path: str = "data",
+                 ) -> None:
+        """
+        Constructor for DataFetcher.
+        """
+        
+        # Ensure the data directory exists
+        Path(directory_path).mkdir(parents=True, exist_ok=True)
+        
+        self.stock_symbols = stock_symbols
+        self.start_date = start_date
+        self.end_date = end_date
+        self.directory_path = directory_path
+        
+    def fetch_and_merge_data(self) -> None:
+        """
+        Fetches data from Yahoo Finance for all symbols and merges them into a single CSV.
+        """
+        import yfinance as yf
+        print('>>>>> Fetching data from Yahoo Finance <<<<<')
+        
+        all_data = []
+        for symbol in self.stock_symbols:
+            try:
+                data = yf.download(symbol, start=self.start_date, end=self.end_date)
+                data['symbol'] = symbol
+                data = data[['Close', 'symbol']]
+                data.columns = ['Close', 'symbol']
+                all_data.append(data)
+            except Exception as e:
+                print(f"Could not download data for {symbol}: {e}")
 
-    # specifying the hardware
-    gpu_devices = ','.join([str(id) for id in args.gpu_devices])
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_devices
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if all_data:
+            df = pd.concat(all_data)
+            df = df.pivot_table(index=df.index, columns='symbol', values='Close')
+            df.to_csv(os.path.join(self.directory_path, 'stocks.csv'))
+            print(f'>>>>> Data saved to {os.path.join(self.directory_path, "stocks.csv")} <<<<<')
+        else:
+            print("No data was successfully fetched.")
 
-    # initializing the random seeds for reproducibility
-    seed = args.seed
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
 
-    # creating all the necessary directory tree structure for efficient logging
-    checkpoint_directory = create_directory_tree(
-        checkpoint_directory=args.checkpoint_directory,
-        simple=args.simple
-    )
+class Preprocessor():
+    """
+    A class to preprocess the raw stock data.
+    """
 
-    # instanciating the scaler
-    scaler = instanciate_scaler(use_scaler=args.use_scaler)
+    def __init__(self, 
+                 df_directory: str = 'data', 
+                 file_name: str = 'stocks.csv',
+                 ) -> None:
+        """
+        Constructor for Preprocessor.
+        """
 
-    # loading the data
-    stock_market_history = load_data(
-        initial_date=args.initial_date,
-        final_date=args.final_date,
-        tickers_subset=args.tickers_subset,
+        self.df_directory = df_directory
+        self.file_name = file_name
+        self.df_path = os.path.join(self.df_directory, self.file_name)
+        self.df = pd.read_csv(self.df_path, index_col=0, parse_dates=True)
+        
+    def collect_close_prices(self) -> pd.DataFrame:
+        """
+        Selects only the Close prices.
+        """
+        
+        self.df.index.name = 'Date'
+        self.df.columns.name = 'Ticker'
+        return self.df
+        
+    def handle_missing_values(self) -> pd.DataFrame:
+        """
+        Fills missing values using forward fill (fillna(method='ffill')) and then drops
+        any remaining NaNs (usually from the beginning of the series).
+        """
+        
+        self.df.fillna(method='ffill', inplace=True)
+        self.df.dropna(inplace=True)
+        
+        self.df.to_csv(os.path.join(self.df_directory, 'close.csv'))
+        
+        return self.df
+
+def load_data(tickers_subset: str, 
+              mode: str, 
+              time_horizon: int,
+              use_corr_matrix: bool = False,
+              use_corr_eigenvalues: bool = False,
+              window: int = 20,
+              n_eigenvalues: int = 10,
+              ) -> pd.DataFrame:
+    """
+    Loads stock data, applies subsetting, and performs training/testing splits and
+    data augmentation (correlation matrix/eigenvalues).
+    
+    Args:
+        tickers_subset (str): Path to the file containing the list of tickers to use.
+        mode (str): 'train' or 'test'.
+        time_horizon (int): Total number of days in the dataset (needed for splitting).
+        use_corr_matrix (bool): Whether to append correlation matrix features.
+        use_corr_eigenvalues (bool): Whether to append correlation eigenvalues features.
+        window (int): Sliding window size for correlation calculation.
+        n_eigenvalues (int): Number of eigenvalues to append.
+        
+    Returns:
+        pd.DataFrame: The processed stock data.
+    """
+
+    if os.path.exists('data/stocks.csv') and not os.path.exists('data/close.csv'):
+        print('>>>>> Extracting close prices and handling missing values <<<<<')
+        preprocessor = Preprocessor(df_directory='data', file_name='stocks.csv')
+        df = preprocessor.collect_close_prices()
+        df = preprocessor.handle_missing_values()
+    
+    elif os.path.exists('data/close.csv'):
+        print('\n>>>>> Reading the preprocessed data <<<<<')
+        df = pd.read_csv('data/close.csv', index_col=0)
+        
+        # FIX: Check if the ticker file exists before trying to open it
+        if not os.path.exists(tickers_subset):
+            # Provide helpful debug information if the file is missing
+            available_files = os.listdir('portfolios_and_tickers') if os.path.exists('portfolios_and_tickers') else "Folder not found"
+            raise FileNotFoundError(
+                f"Ticker subset file not found: {tickers_subset}\n"
+                f"Available files in portfolios_and_tickers/: {available_files}"
+            )
+            
+        with open(tickers_subset) as f:
+            stocks_subset = f.read().splitlines()
+            stocks_subset = [ticker for ticker in stocks_subset if ticker in df.columns]
+            
+        df = df[stocks_subset]
+    
+    else:
+        raise FileNotFoundError("Data files not found.")
+        
+    # --- Data Augmentation ---
+    # Append correlation features if requested
+    if use_corr_matrix:
+        df = append_corr_matrix(df=df, window=window)
+    
+    if use_corr_eigenvalues:
+        df = append_corr_matrix_eigenvalues(df=df, window=window, number_of_eigenvalues=n_eigenvalues)
+
+    # --- Train/Test Split ---
+    # Use the entire loaded time series length for splitting
+    data_size = df.shape[0] 
+    
+    if mode == 'train':
+        # Train data is the first 75%
+        df = df.iloc[: 3*data_size//4]
+    elif mode == 'test':
+        # Test data is the last 25%
+        df = df.iloc[3*data_size//4:]
+    
+    # Ensure the dataframe still has enough data points for the given time horizon
+    if df.shape[0] < time_horizon:
+        raise ValueError(f"Not enough data points ({df.shape[0]}) for the specified time horizon ({time_horizon}) after train/test split.")
+        
+    print(f'>>>>> Data loaded for {mode} mode, shape: {df.shape} <<<<<')
+    
+    return df
+
+
+def _read_tickers_file(path: str) -> List[str]:
+    with open(path) as f:
+        tickers = f.read().splitlines()
+    return [t for t in tickers if t]
+
+
+def _load_initial_portfolio_for_env(initial_portfolio_path: str, tickers: List[str]) -> dict:
+    with open(initial_portfolio_path, 'r') as f:
+        portfolio = json.load(f)
+
+    cash_in_bank = float(portfolio.get('Bank_account', 0.0))
+    number_of_shares = np.array([float(portfolio.get(ticker, 0.0)) for ticker in tickers], dtype=np.float32)
+    return {
+        'cash_in_bank': cash_in_bank,
+        'number_of_shares': number_of_shares,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
+    parser.add_argument('--n_episodes', type=int, default=2)
+    parser.add_argument('--time_horizon', type=int, default=252)
+    parser.add_argument('--seed', type=int, default=0)
+
+    parser.add_argument('--assets_to_trade', type=str, default='portfolios_and_tickers/tickers_S&P500_dummy.txt')
+    parser.add_argument('--initial_portfolio', type=str, default='portfolios_and_tickers/initial_portfolio_subset.json')
+
+    parser.add_argument('--start_date', type=str, default='2010-01-01')
+    parser.add_argument('--end_date', type=str, default='2020-12-31')
+
+    parser.add_argument('--checkpoint_directory', type=str, default=None)
+    parser.add_argument('--plot', action='store_true')
+    parser.add_argument('--use_scaler', action='store_true')
+
+    parser.add_argument('--use_corr_matrix', action='store_true')
+    parser.add_argument('--use_corr_eigenvalues', action='store_true')
+    parser.add_argument('--window', type=int, default=20)
+    parser.add_argument('--number_of_eigenvalues', type=int, default=10)
+
+    parser.add_argument('--buy_cost', type=float, default=0.001)
+    parser.add_argument('--sell_cost', type=float, default=0.001)
+    parser.add_argument('--bank_rate', type=float, default=0.5)
+    parser.add_argument('--limit_n_stocks', type=float, default=200)
+    parser.add_argument('--buy_rule', type=str, default='most_first')
+    parser.add_argument('--target_return_rate', type=float, default=0.25)
+    parser.add_argument('--sac_temperature', type=float, default=0.1)
+
+    parser.add_argument('--lr_Q', type=float, default=0.0003)
+    parser.add_argument('--lr_pi', type=float, default=0.0003)
+    parser.add_argument('--lr_alpha', type=float, default=0.0003)
+    parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--tau', type=float, default=0.005)
+    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--layer_size', type=int, default=256)
+    parser.add_argument('--memory_size', type=int, default=1000000)
+    parser.add_argument('--delay', type=int, default=1)
+    parser.add_argument('--grad_clip', type=float, default=1.0)
+    parser.add_argument('--auto_alpha', action='store_true', default=True)
+    parser.add_argument('--no_auto_alpha', action='store_false', dest='auto_alpha')
+    parser.add_argument('--agent_type', type=str, default='sac', choices=['sac', 'distributional'])
+    parser.add_argument('--device', type=str, default='cpu')
+
+    args = parser.parse_args()
+
+    tickers = _read_tickers_file(args.assets_to_trade)
+
+    if not os.path.exists('data/close.csv'):
+        fetcher = DataFetcher(
+            stock_symbols=tickers,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            directory_path='data',
+        )
+        fetcher.fetch_and_merge_data()
+
+        preprocessor = Preprocessor(df_directory='data', file_name='stocks.csv')
+        preprocessor.collect_close_prices()
+        preprocessor.handle_missing_values()
+
+    df = load_data(
+        tickers_subset=args.assets_to_trade,
         mode=args.mode,
-        scaler=scaler
+        time_horizon=args.time_horizon,
+        use_corr_matrix=args.use_corr_matrix,
+        use_corr_eigenvalues=args.use_corr_eigenvalues,
+        window=args.window,
+        n_eigenvalues=args.number_of_eigenvalues,
     )
 
-    # preparing the initial portfolio
-    initial_portfolio = prepare_initial_portfolio(
-        initial_portfolio_value=args.initial_portfolio_value,
-        stock_market_history=stock_market_history
-    )
+    initial_portfolio = _load_initial_portfolio_for_env(args.initial_portfolio, tickers=tickers)
 
-    # instanciating the environment
     env = Environment(
-        stock_market_history=stock_market_history,
+        stock_market_history=df,
         initial_portfolio=initial_portfolio,
         buy_cost=args.buy_cost,
         sell_cost=args.sell_cost,
         bank_rate=args.bank_rate,
         limit_n_stocks=args.limit_n_stocks,
         buy_rule=args.buy_rule,
-        # --- NEW GBI PARAMETERS PASSED TO ENVIRONMENT ---
         target_return_rate=args.target_return_rate,
         max_steps_per_episode=args.time_horizon,
-        # ----------------------------------------------
         use_corr_matrix=args.use_corr_matrix,
         use_corr_eigenvalues=args.use_corr_eigenvalues,
         window=args.window,
-        number_of_eigenvalues=args.number_of_eigenvalues
+        number_of_eigenvalues=args.number_of_eigenvalues,
     )
 
-    # instanciating the agent
-    agent = instanciate_agent(
-        args=args,
+    checkpoint_directory = create_directory_tree(checkpoint_directory=args.checkpoint_directory, mode=args.mode)
+    checkpoint_directory_networks = os.path.join(checkpoint_directory, 'networks')
+
+    scaler = instanciate_scaler(
+        use_scaler=args.use_scaler,
         env=env,
-        device=device,
-        checkpoint_directory=checkpoint_directory
+        mode=args.mode,
+        checkpoint_directory=checkpoint_directory,
     )
 
-    # instanciating the run
-    run = Run(
+    agent = instanciate_agent(args=args, env=env, checkpoint_directory_networks=checkpoint_directory_networks, device=args.device)
+
+    runner = Run(
         env=env,
         agent=agent,
         n_episodes=args.n_episodes,
@@ -87,82 +311,25 @@ def main(args):
         checkpoint_directory=checkpoint_directory,
         sac_temperature=args.sac_temperature,
         mode=args.mode,
-        plot=args.plot
+        plot=args.plot,
     )
 
-    # logging initial portfolio value
-    run.logger._store_initial_value_portfolio(initial_portfolio['portfolio_value'])
+    # ================================
+    # RUN TRAINING / TESTING EPISODES
+    # ================================
 
-    # running the training/testing loop
-    run.logger.set_time_stamp(1)
-    for _ in range(args.n_episodes):
-        run.run_episode()
-    run.logger.set_time_stamp(2)
-    run.logger.print_status()
+    for episode in range(args.n_episodes):
+        runner.run_episode()
+        print(f"[INFO] Episode {episode + 1}/{args.n_episodes} completed")
 
-    # save the logs and plot the results
-    run.logger.save_logs()
-    if args.plot:
-        run.logger.plot_results()
+    # Save networks at the end of training (ensure they're always saved)
+    if args.mode == 'train':
+        runner.agent.save_networks()
+        print("[INFO] Networks saved to disk")
+
+    # Save logs and plots after training
+    runner.logger.save_logs_and_plots(args.n_episodes)
 
 
 if __name__ == '__main__':
-
-    parser = ArgumentParser()
-
-    # parameters concerning the run itself (train or test)
-    parser.add_argument('--mode',             type=str,            default='train', help='Train or test mode')
-    parser.add_argument('--n_episodes',       type=int,            default=50000,   help='Number of episodes to run')
-    parser.add_argument('--sac_temperature',  type=float,          default=1.0,     help='The temperature (alpha) parameter of the SAC algorithm')
-
-    # parameters concerning data preprocessing
-    parser.add_argument('--initial_date',     type=str,            default='2010-01-01', help='Start date for data fetching')
-    parser.add_argument('--final_date',       type=str,            default='2020-12-31', help='End date for data fetching')
-    parser.add_argument('--tickers_subset',   type=str,            default='portfolios_and_tickers/subset_tickers_S&P500.txt', help='Path to the file containing the tickers to use')
-
-    # parameters concerning the environment and the learning process
-    group1 = parser.add_mutually_exclusive_group()
-    group1.add_argument('--use_scaler',             action='store_true', default=False, help='Whether to normalize the environment state (except for the correlation matrix) or not')
-    parser.add_argument('--initial_portfolio_value', type=float,          default=10000.0, help='Starting value of the portfolio')
-    parser.add_argument('--buy_cost',                type=float,          default=0.001,   help='Transaction cost when buying, expressed in fraction')
-    parser.add_argument('--sell_cost',               type=float,          default=0.001,   help='Transaction cost when selling, expressed in fraction')
-    parser.add_argument('--bank_rate',               type=float,          default=0.5,     help='The rate at which the bank account is growing (or shrinking)')
-    parser.add_argument('--limit_n_stocks',          type=float,          default=200,     help='Upper limit to the number of stocks we can own')
-    parser.add_argument('--buy_rule',                type=str,            default='most_first', help='Rule according to which stocks are bought, either most_first or least_first')
-    
-    # --- NEW GBI PARAMETERS START ---
-    # These parameters explicitly define the Goal-Based Investment objective
-    parser.add_argument('--target_return_rate',      type=float,          default=0.25,    help='Target return rate for the investment goal (e.g., 0.25 for 25% goal)')
-    parser.add_argument('--time_horizon',            type=int,            default=252,     help='Number of steps (trading days) to reach the goal (e.g., 252 for 1 year)')
-    # --- NEW GBI PARAMETERS END ---
-
-    # parameters concerning the agent type (SAC variants)
-    parser.add_argument('--agent_type',       type=str,            default='regular', help='SAC agent type: regular, distributional or manual_temperature')
-    parser.add_argument('--lr_Q',             type=float,          default=0.0003,    help='Learning rate for the Q-networks')
-    parser.add_argument('--lr_pi',            type=float,          default=0.0003,    help='Learning rate for the Actor network')
-    parser.add_argument('--lr_alpha',         type=float,          default=0.0003,    help='Learning rate for the temperature (alpha) network')
-    parser.add_argument('--tau',              type=float,          default=0.005,     help='Interpolation factor for the target networks')
-    parser.add_argument('--memory_size',      type=int,            default=1000000,   help='Size of the Replay Buffer')
-    parser.add_argument('--layer_size',       type=int,            default=256,       help='Number of neurons in the hidden layers')
-    parser.add_argument('--batch_size',       type=int,            default=256,       help='Batch size for learning')
-    parser.add_argument('--delay',            type=int,            default=1,         help='Delay factor for target networks update')
-    parser.add_argument('--grad_clip',        type=float,          default=1.0,       help='Clip the gradients to this value')
-
-    # miscellaneous parameters
-    parser.add_argument('--simple',               action='store_true', default=False,        help='Whether to save the outputs in an overwritten directory, used simple experiments and tuning')
-    
-    # random seed, logs information and hardware
-    parser.add_argument('--checkpoint_directory', type=str,            default=None,         help='In test mode, specify the directory in which to find the weights of the trained networks')
-    parser.add_argument('--plot',                 action='store_true', default=False,        help='Whether to automatically generate plots or not')
-    parser.add_argument('--seed',                 type=int,            default='42',         help='Random seed for reproducibility')
-    parser.add_argument('--gpu_devices',          type=int, nargs='+', default=[0, 1, 2, 3], help='Specify the GPUs if any')
-    
-    # parameters concerning data preprocessing
-    group2 = parser.add_mutually_exclusive_group()
-    group2.add_argument('--use_corr_matrix',       action='store_true', default=False, help='To append the sliding correlation matrix to the time series')
-    group2.add_argument('--use_corr_eigenvalues',  action='store_true', default=False, help='To append the eigenvalues of the correlation matrix to the time series')
-    parser.add_argument('--window',                type=int,            default=20,    help='Window for correlation matrix computation')
-    parser.add_argument('--number_of_eigenvalues', type=int,            default=10,    help='Number of largest eigenvalues to append to the close prices time series')
-     
-    args = parser.parse_args()
-    main(args)
+    main()
